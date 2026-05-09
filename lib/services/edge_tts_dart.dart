@@ -1,10 +1,8 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 import '../models/voice_option.dart';
 
 /// Direct Edge TTS via WebSocket — no proxy needed.
@@ -15,11 +13,9 @@ class EdgeTtsDart {
   // EDGE TTS CONSTANTS
   // ═══════════════════════════════════════════════
 
-  static const String _edgeWsUrl =
+  static const String _wsUrl =
       'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       '?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-
-  static const String _trustedToken = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 
   // Edge TTS sends audio in chunks, we accumulate them here
   Uint8List? _audioBuffer;
@@ -131,76 +127,77 @@ class EdgeTtsDart {
   }) async {
     debugCallback?.call('🔌 連接 Edge TTS...');
 
-    WebSocketChannel? channel;
+    WebSocket? ws;
     try {
-      channel = WebSocketChannel.connect(
-        Uri.parse(_edgeWsUrl),
+      // Use native WebSocket with browser-emulating headers
+      ws = await WebSocket.connect(
+        _wsUrl,
         protocols: ['webSocket'],
+        headers: {
+          'Pragma': 'no-cache',
+          'Cache-Control': 'no-cache',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+          'Origin': 'chrome-extension://jdiccldimpdaiepdoknfepnbjgkoldm',
+        },
       );
 
-      // Wait for connection
-      await channel.ready.timeout(const Duration(seconds: 10), onTimeout: () {
-        throw TimeoutException('WebSocket connection timed out');
-      });
-      debugCallback?.call('✅ 已連接');
-
-      _audioBuffer = null;
+      debugCallback?.call('✅ 已連接 (${ws.readyState})');
 
       // Send speech.config first
       final configMsg = _buildSpeechConfig();
-      channel.sink.add(configMsg);
+      ws.add(configMsg);
       debugCallback?.call('📤 發送 speech.config...');
 
-      // Give server time to process
-      await Future.delayed(const Duration(milliseconds: 50));
+      // Small delay before SSML
+      await Future.delayed(const Duration(milliseconds: 100));
 
       // Send SSML
       final ssmlMsg = _buildSsml(text, voiceShortName, rate, pitch);
-      channel.sink.add(ssmlMsg);
+      ws.add(ssmlMsg);
       debugCallback?.call('📤 發送 SSML (${text.length} chars)...');
 
       // Collect audio chunks
       final audioChunks = <int>[];
       int messageCount = 0;
 
-      await for (final msg in channel.stream) {
+      await for (final msg in ws) {
         messageCount++;
         if (msg is List<int>) {
-          // Binary audio data
           if (msg.isNotEmpty) {
             audioChunks.addAll(msg);
             debugCallback?.call('🔊 +${msg.length} bytes');
           }
         } else if (msg is String) {
-          // Text message (e.g., "Path:turn.end")
           debugCallback?.call('📨 $msg');
-          if (msg.contains('turn.end') || msg.contains('close')) {
+          if (msg.contains('turn.end') || msg.contains('Path:turn.end')) {
             break;
           }
         }
       }
 
-      debugCallback?.call('✅ 完成，共 ${audioChunks.length} bytes ($messageCount messages)');
+      debugCallback?.call('✅ 完成，共 ${audioChunks.length} bytes');
 
       if (audioChunks.isEmpty) {
         debugCallback?.call('❌ 無音頻數據');
+        ws.close();
         return null;
       }
 
-      // MP3 files need a proper header if missing
       final mp3Bytes = Uint8List.fromList(audioChunks);
+      ws.close();
       return mp3Bytes;
 
     } on TimeoutException {
-      debugCallback?.call('❌ 連接超時（網絡問題或被防火牆阻擋）');
-    } on WebSocketChannelException catch (e) {
-      debugCallback?.call('❌ WebSocketChannelException: $e');
+      debugCallback?.call('❌ 連接超時');
+    } on WebSocketException catch (e) {
+      debugCallback?.call('❌ WebSocketException: $e');
     } on SocketException catch (e) {
       debugCallback?.call('❌ SocketException: $e');
     } catch (e) {
       debugCallback?.call('❌ 異常: $e');
     } finally {
-      await channel?.sink.close();
+      ws?.close();
     }
     return null;
   }
