@@ -1,78 +1,126 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 import '../models/voice_option.dart';
 
-/// Complete edge-tts implementation in pure Dart for Flutter/Android
-/// Uses Python proxy on Mac for Edge TTS WebSocket protocol
+/// Direct Edge TTS via WebSocket — no proxy needed.
+/// Works on iOS and Android without any server.
+/// Based on the edge-tts Python library protocol.
 class EdgeTtsDart {
   // ═══════════════════════════════════════════════
-  // CONSTANTS
+  // EDGE TTS CONSTANTS
   // ═══════════════════════════════════════════════
 
-  /// Proxy URL for Edge TTS (runs on Mac). Default: auto-detect from platform.
-  /// Can be set explicitly, e.g. 'http://192.168.31.124:50022'
-  String? _proxyUrl;
-  List<EdgeVoice>? _cachedVoices;
+  static const String _edgeWsUrl =
+      'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
+      '?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 
-  void setProxy(String url) {
-    _proxyUrl = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
-  }
+  static const String _trustedToken = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 
-  String get _ttsProxyUrl => _proxyUrl ?? 'http://192.168.31.124:8888';
+  // Edge TTS sends audio in chunks, we accumulate them here
+  Uint8List? _audioBuffer;
 
   // ═══════════════════════════════════════════════
-  // VOICE MODEL
+  // VOICE LIST (hardcoded — covers major languages)
   // ═══════════════════════════════════════════════
-
-  EdgeVoice voiceFromJson(Map<String, dynamic> json) {
-    return EdgeVoice(
-      name: json['Name'] ?? '',
-      shortName: json['ShortName'] ?? '',
-      gender: json['Gender'] ?? 'Female',
-      locale: json['Locale'] ?? '',
-      friendlyName: json['FriendlyName'] ?? '',
-      suggestedStyle: json['SuggestedStyle'] != null ? List<String>.from(json['SuggestedStyle']) : [],
-    );
-  }
-
-  // ═══════════════════════════════════════════════
-  // VOICE LIST API
-  // ═══════════════════════════════════════════════
-
-  Future<List<EdgeVoice>> getVoices({bool forceRefresh = false}) async {
-    // Voice list is provided by the proxy server (edge-tts voices list endpoint)
-    // For now, use the hardcoded fallback voices which cover all major languages
-    return _fallbackVoices;
-  }
 
   static final List<EdgeVoice> _fallbackVoices = [
-    // Mandarin/Cantonese voices
+    // Mandarin / Cantonese
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoxiaoNeural)', shortName: 'zh-CN-XiaoxiaoNeural', gender: 'Female', locale: 'zh-CN', friendlyName: 'Xiaoxiao'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoyiNeural)', shortName: 'zh-CN-XiaoyiNeural', gender: 'Female', locale: 'zh-CN', friendlyName: 'Xiaoyi'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunjianNeural)', shortName: 'zh-CN-YunjianNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunjian'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunxiNeural)', shortName: 'zh-CN-YunxiNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunxi'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunxiaNeural)', shortName: 'zh-CN-YunxiaNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunxia'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunyangNeural)', shortName: 'zh-CN-YunyangNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunyang'),
+    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-TW, HsiaoYuNeural)', shortName: 'zh-TW-HsiaoYuNeural', gender: 'Female', locale: 'zh-TW', friendlyName: 'HsiaoYu'),
+    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-TW, YunJheNeural)', shortName: 'zh-TW-YunJheNeural', gender: 'Male', locale: 'zh-TW', friendlyName: 'YunJhe'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, HiuGaaiNeural)', shortName: 'zh-HK-HiuGaaiNeural', gender: 'Female', locale: 'zh-HK', friendlyName: 'HiuGaai'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, HiuMaanNeural)', shortName: 'zh-HK-HiuMaanNeural', gender: 'Female', locale: 'zh-HK', friendlyName: 'HiuMaan'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, WanLungNeural)', shortName: 'zh-HK-WanLungNeural', gender: 'Male', locale: 'zh-HK', friendlyName: 'WanLung'),
-    // Japanese voices
+    // Japanese
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (ja-JP, NanamiNeural)', shortName: 'ja-JP-NanamiNeural', gender: 'Female', locale: 'ja-JP', friendlyName: 'Nanami'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (ja-JP, KeiichiNeural)', shortName: 'ja-JP-KeiichiNeural', gender: 'Male', locale: 'ja-JP', friendlyName: 'Keiichi'),
-    // English voices
+    // English
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)', shortName: 'en-US-AriaNeural', gender: 'Female', locale: 'en-US', friendlyName: 'Aria'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, GuyNeural)', shortName: 'en-US-GuyNeural', gender: 'Male', locale: 'en-US', friendlyName: 'Guy'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, JennyNeural)', shortName: 'en-US-JennyNeural', gender: 'Female', locale: 'en-US', friendlyName: 'Jenny'),
   ];
 
   // ═══════════════════════════════════════════════
+  // VOICE LIST API
+  // ═══════════════════════════════════════════════
+
+  Future<List<EdgeVoice>> getVoices({bool forceRefresh = false}) async {
+    return _fallbackVoices;
+  }
+
+  // ═══════════════════════════════════════════════
+  // WEBSOCKET MESSAGE BUILDERS
+  // ═══════════════════════════════════════════════
+
+  String _buildTimestamp() {
+    final now = DateTime.now().toUtc();
+    final pad = (int v) => v.toString().padLeft(2, '0');
+    return '${now.year}-${pad(now.month)}-${pad(now.day)}-'
+        '${pad(now.hour)}:${pad(now.minute)}:${pad(now.second)}.'
+        '${(now.millisecond).toString().padLeft(3, '0')}Z';
+  }
+
+  String _buildSpeechConfig() {
+    final ts = _buildTimestamp();
+    return 'X-RequestId:${_genReqId()}\r\n'
+        'Content-Type:application/json; charset=utf-8\r\n'
+        'X-Timestamp:$ts\r\n'
+        'Path:speech.config\r\n\r\n'
+        '{"context":{"synthesis":{"audio":{"metadataoptions":'
+        '{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},'
+        '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}';
+  }
+
+  String _buildSsml(String text, String voiceShortName, double rate, double pitch) {
+    final ts = _buildTimestamp();
+    // Edge TTS rate/pitch: 1.0 = normal. Convert from speed multiplier.
+    // speed: 1.0=normal, >1=faster, <1=slower
+    // pitch: 1.0=normal
+    final ratePercent = ((rate - 1.0) * 100).round();
+    final pitchHz = ((pitch - 1.0) * 50).round(); // ±50Hz
+    final ssmlPitch = pitch != 1.0 ? ' msst Pitch="${pitchHz}Hz"' : '';
+
+    return 'X-RequestId:${_genReqId()}\r\n'
+        'Content-Type:application/ssml+xml\r\n'
+        'X-Timestamp:$ts\r\n'
+        'Path:ssml\r\n\r\n'
+        '<speak version='"'"'1.0'"'"' '
+        'xmlns='"'"'http://www.w3.org/2001/10/synthesis'"'"' '
+        'xml:lang='"'"'${_voiceLocale(voiceShortName)}'"'"'>'
+        '<voice name='"'"'$voiceShortName'"'"'$ssmlPitch>'
+        '<prosody rate='"'"'$ratePercent%'"'"' pitch="${pitchHz}Hz">'
+        '$text'
+        '</prosody></voice></speak>';
+  }
+
+  String _voiceLocale(String shortName) {
+    final parts = shortName.split('-');
+    if (parts.length >= 2) return '${parts[0]}-${parts[1]}';
+    return 'en-US';
+  }
+
+  // Simple request ID generator
+  int _reqIdCounter = 0;
+  String _genReqId() {
+    _reqIdCounter = (_reqIdCounter + 1) % 100000;
+    return '${DateTime.now().millisecondsSinceEpoch.toRadixString(16).padLeft(12, '0')}${_reqIdCounter.toRadixString(16).padLeft(5, '0')}';
+  }
+
+  // ═══════════════════════════════════════════════
   // TTS SYNTHESIS
   // ═══════════════════════════════════════════════
 
-  /// Synthesize speech to MP3 bytes via Edge TTS proxy on Mac
+  /// Synthesize speech to MP3 bytes via direct Edge TTS WebSocket.
   Future<Uint8List?> synthesize({
     required String text,
     required String voiceShortName,
@@ -81,56 +129,78 @@ class EdgeTtsDart {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
-    debugCallback?.call('🌐 連接 Edge TTS 代理 (${_ttsProxyUrl})...');
+    debugCallback?.call('🔌 連接 Edge TTS...');
 
+    WebSocketChannel? channel;
     try {
-      final uri = Uri.parse('$_ttsProxyUrl/tts');
-      final bodyBytes = utf8.encode(jsonEncode({
-        'text': text,
-        'voice': voiceShortName,
-        'rate': rate,
-        'pitch': pitch,
-        'volume': volume,
-      }));
+      channel = WebSocketChannel.connect(
+        Uri.parse(_edgeWsUrl),
+        protocols: ['webSocket'],
+      );
 
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 30);
+      // Wait for connection
+      await channel.ready.timeout(const Duration(seconds: 10), onTimeout: () {
+        throw TimeoutException('WebSocket connection timed out');
+      });
+      debugCallback?.call('✅ 已連接');
 
-      final req = await client.postUrl(uri);
-      req.headers.set('Content-Type', 'application/json; charset=utf-8');
-      req.headers.set('Content-Length', '${bodyBytes.length}');
-      req.add(bodyBytes);
+      _audioBuffer = null;
 
-      debugCallback?.call('📤 發送 ${bodyBytes.length} bytes...');
-      final resp = await req.close();
+      // Send speech.config first
+      final configMsg = _buildSpeechConfig();
+      channel.sink.add(configMsg);
+      debugCallback?.call('📤 發送 speech.config...');
 
-      if (resp.statusCode != 200) {
-        final err = await resp.transform(utf8.decoder).join();
-        debugCallback?.call('❌ HTTP ${resp.statusCode}: $err');
-        client.close();
-        return null;
+      // Give server time to process
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      // Send SSML
+      final ssmlMsg = _buildSsml(text, voiceShortName, rate, pitch);
+      channel.sink.add(ssmlMsg);
+      debugCallback?.call('📤 發送 SSML (${text.length} chars)...');
+
+      // Collect audio chunks
+      final audioChunks = <int>[];
+      int messageCount = 0;
+
+      await for (final msg in channel.stream) {
+        messageCount++;
+        if (msg is List<int>) {
+          // Binary audio data
+          if (msg.isNotEmpty) {
+            audioChunks.addAll(msg);
+            debugCallback?.call('🔊 +${msg.length} bytes');
+          }
+        } else if (msg is String) {
+          // Text message (e.g., "Path:turn.end")
+          debugCallback?.call('📨 $msg');
+          if (msg.contains('turn.end') || msg.contains('close')) {
+            break;
+          }
+        }
       }
 
-      final audioBytes = <int>[];
-      await for (final chunk in resp) {
-        audioBytes.addAll(chunk);
-        debugCallback?.call('🔊 +${chunk.length} bytes');
-      }
+      debugCallback?.call('✅ 完成，共 ${audioChunks.length} bytes ($messageCount messages)');
 
-      client.close();
-      debugCallback?.call('✅ 完成，共 ${audioBytes.length} bytes');
-
-      if (audioBytes.isEmpty) {
+      if (audioChunks.isEmpty) {
         debugCallback?.call('❌ 無音頻數據');
         return null;
       }
-      return Uint8List.fromList(audioBytes);
-    } on HttpException catch (e) {
-      debugCallback?.call('❌ HttpException: $e');
+
+      // MP3 files need a proper header if missing
+      final mp3Bytes = Uint8List.fromList(audioChunks);
+      return mp3Bytes;
+
+    } on TimeoutException {
+      debugCallback?.call('❌ 連接超時（網絡問題或被防火牆阻擋）');
+    } on WebSocketChannelException catch (e) {
+      debugCallback?.call('❌ WebSocketChannelException: $e');
     } on SocketException catch (e) {
       debugCallback?.call('❌ SocketException: $e');
     } catch (e) {
       debugCallback?.call('❌ 異常: $e');
+    } finally {
+      await channel?.sink.close();
     }
     return null;
   }
@@ -187,10 +257,8 @@ class EdgeTtsDart {
         voiceKey = narrationVoice;
       }
 
-      // Resolve short name
       String shortName = voiceKey;
       if (!voiceKey.contains('Neural')) {
-        // It's a locale key like "zh-HK", find first matching voice
         final voices = await getVoices();
         final found = voices.firstWhere(
           (v) => v.locale == voiceKey && v.gender == 'Female',
@@ -222,13 +290,10 @@ class EdgeTtsDart {
     return segments;
   }
 
-  /// Merge multiple MP3 files into one
+  /// Merge multiple MP3 files into one (simple concatenation)
   Future<String?> mergeMp3Files(List<String> inputPaths, String outputPath) async {
-    // Simple concatenation for MP3 files
-    // For a production app, use a proper MP3 merge library
     final outputFile = File(outputPath);
     final sink = outputFile.openWrite();
-
     try {
       for (final path in inputPaths) {
         final file = File(path);
@@ -247,7 +312,6 @@ class EdgeTtsDart {
   // HELPERS
   // ═══════════════════════════════════════════════
 
-  /// Parse script into speaker/text pairs
   List<ParsedLine> parseScript(String script) {
     final lines = script.trim().split('\n');
     final result = <ParsedLine>[];
@@ -266,9 +330,7 @@ class EdgeTtsDart {
     return result;
   }
 
-  void dispose() {
-    _cachedVoices = null;
-  }
+  void dispose() {}
 }
 
 /// Edge TTS Voice model
