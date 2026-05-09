@@ -125,81 +125,71 @@ class EdgeTtsDart {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
-    debugCallback?.call('🔌 連接 Edge TTS...');
+    // 1. 強制清洗 URL，避免末尾出現 # 或空格
+    final cleanUrl = _wsUrl.trim().split('#')[0];
+    debugCallback?.call('🔌 連接 Edge TTS (Android Fix Applied)...');
 
     WebSocket? ws;
     try {
-      // Use native WebSocket with browser-emulating headers
+      // 2. 建立連接：移除 protocols，更新 UA 和 Origin
       ws = await WebSocket.connect(
-        _wsUrl,
-        protocols: ['webSocket'],
+        cleanUrl,
         headers: {
           'Pragma': 'no-cache',
           'Cache-Control': 'no-cache',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-          'Origin': 'chrome-extension://jdiccldimpdaiepdoknfepnbjgkoldm',
+              '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
+          'Origin': 'chrome-extension://jdiccldjedidmcnnefciiohendbhjhj',
         },
-      );
+      ).timeout(const Duration(seconds: 10));
 
-      debugCallback?.call('✅ 已連接 (${ws.readyState})');
+      debugCallback?.call('✅ 已連接');
 
-      // Send speech.config first
-      final configMsg = _buildSpeechConfig();
-      ws.add(configMsg);
-      debugCallback?.call('📤 發送 speech.config...');
+      // 3. 發送配置與 SSML
+      ws.add(_buildSpeechConfig());
+      await Future.delayed(const Duration(milliseconds: 50));
+      ws.add(_buildSsml(text, voiceShortName, rate, pitch));
 
-      // Small delay before SSML
-      await Future.delayed(const Duration(milliseconds: 100));
-
-      // Send SSML
-      final ssmlMsg = _buildSsml(text, voiceShortName, rate, pitch);
-      ws.add(ssmlMsg);
-      debugCallback?.call('📤 發送 SSML (${text.length} chars)...');
-
-      // Collect audio chunks
       final audioChunks = <int>[];
-      int messageCount = 0;
 
+      // 4. 解析二進制流
       await for (final msg in ws) {
-        messageCount++;
         if (msg is List<int>) {
-          if (msg.isNotEmpty) {
-            audioChunks.addAll(msg);
-            debugCallback?.call('🔊 +${msg.length} bytes');
+          final data = Uint8List.fromList(msg);
+          if (data.length >= 2) {
+            // 解析 Header 長度 (Big-endian)
+            final headerLen = (data[0] << 8) | data[1];
+            final audioStart = 2 + headerLen;
+
+            // 確保只提取音頻數據部分
+            if (audioStart < data.length) {
+              final audioPart = data.sublist(audioStart);
+              audioChunks.addAll(audioPart);
+              // debugCallback?.call('🔊 接收音頻幀: ${audioPart.length} bytes');
+            }
           }
         } else if (msg is String) {
-          debugCallback?.call('📨 $msg');
-          if (msg.contains('turn.end') || msg.contains('Path:turn.end')) {
+          if (msg.contains('turn.end')) {
+            debugCallback?.call('🏁 收到結束信號 (turn.end)');
             break;
           }
         }
       }
 
-      debugCallback?.call('✅ 完成，共 ${audioChunks.length} bytes');
-
       if (audioChunks.isEmpty) {
-        debugCallback?.call('❌ 無音頻數據');
-        ws.close();
+        debugCallback?.call('❌ 錯誤：未收到任何音頻數據');
         return null;
       }
 
-      final mp3Bytes = Uint8List.fromList(audioChunks);
-      ws.close();
-      return mp3Bytes;
+      debugCallback?.call('🎉 合成完成，總計 ${audioChunks.length} bytes');
+      return Uint8List.fromList(audioChunks);
 
-    } on TimeoutException {
-      debugCallback?.call('❌ 連接超時');
-    } on WebSocketException catch (e) {
-      debugCallback?.call('❌ WebSocketException: $e');
-    } on SocketException catch (e) {
-      debugCallback?.call('❌ SocketException: $e');
     } catch (e) {
       debugCallback?.call('❌ 異常: $e');
+      return null;
     } finally {
-      ws?.close();
+      await ws?.close();
     }
-    return null;
   }
 
   /// Synthesize to MP3 file, returns file path
