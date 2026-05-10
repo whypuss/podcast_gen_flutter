@@ -1,20 +1,27 @@
 package com.podcastgen.podcast_gen
 
 import android.media.MediaPlayer
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.*
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
-    private val CHANNEL = "com.podcastgen.podcast_gen/audio"
+    private val AUDIO_CHANNEL = "com.podcastgen.podcast_gen/audio"
+    private val TTS_CHANNEL = "com.podcastgen.podcast_gen/edgetts"
     private var mediaPlayer: MediaPlayer? = null
     private var isPrepared = false
+    private var ttsEngine: EdgeTtsEngine? = null
+    private val ttsScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+        // Audio playback channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "play" -> {
                     val filePath = call.argument<String>("filePath")
@@ -32,7 +39,7 @@ class MainActivity : FlutterActivity() {
                                 result.success(true)
                             }
                             setOnCompletionListener {
-                                result.success(true) // playback done
+                                result.success(true)
                             }
                             setOnErrorListener { _, what, extra ->
                                 android.util.Log.e("AudioPlayer", "MediaPlayer error: $what, $extra")
@@ -74,11 +81,51 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // Edge TTS native channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, TTS_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "synthesize" -> {
+                    val text = call.argument<String>("text") ?: ""
+                    val voice = call.argument<String>("voice") ?: "en-US-AriaNeural"
+                    val rate = call.argument<String>("rate") ?: "+0%"
+                    val pitch = call.argument<String>("pitch") ?: "+0Hz"
+                    val volume = call.argument<String>("volume") ?: "+0%"
+                    val outputFormat = call.argument<String>("outputFormat") ?: "audio-24khz-48kbitrate-mono-mp3"
+
+                    ttsScope.launch {
+                        val engine = EdgeTtsEngine()
+                        ttsEngine = engine
+                        val audioBytes = engine.synthesize(text, voice, rate, pitch, volume, outputFormat)
+                        engine.close()
+                        ttsEngine = null
+
+                        if (audioBytes != null && audioBytes.isNotEmpty()) {
+                            // Save to temp file and return path
+                            val cacheDir = cacheDir
+                            val outputFile = File(cacheDir, "edge_tts_output_${System.currentTimeMillis()}.mp3")
+                            FileOutputStream(outputFile).use { it.write(audioBytes) }
+                            result.success(outputFile.absolutePath)
+                        } else {
+                            result.error("TTS_ERROR", "No audio generated", null)
+                        }
+                    }
+                }
+                "stop" -> {
+                    ttsEngine?.close()
+                    ttsEngine = null
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     override fun onDestroy() {
         mediaPlayer?.release()
         mediaPlayer = null
+        ttsEngine?.close()
+        ttsScope.cancel()
         super.onDestroy()
     }
 }

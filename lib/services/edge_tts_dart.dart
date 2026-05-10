@@ -5,10 +5,12 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../models/voice_option.dart';
+import 'native_edge_tts.dart';
 
 /// Edge TTS service with dual backends:
 /// - Direct WebSocket (iOS/macOS/Linux)
@@ -188,7 +190,7 @@ class EdgeTtsDart {
   // TTS SYNTHESIS
   // ═══════════════════════════════════════════════
 
-  /// Main synthesize method — tries WebSocket first, falls back to HTTP proxy on Android.
+  /// Main synthesize method — Android uses NativeEdgeTts (Ktor), others use Dart WebSocket.
   Future<Uint8List?> synthesize({
     required String text,
     required String voiceShortName,
@@ -197,8 +199,27 @@ class EdgeTtsDart {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
-    // Try WebSocket first (works on iOS/macOS/Linux)
-    debugCallback?.call('🔌 嘗試直接 Edge TTS...');
+    // Android: use native Ktor WebSocket engine
+    if (Platform.isAndroid) {
+      debugCallback?.call('🤖 Android: 使用原生 Ktor 引擎...');
+      final native = NativeEdgeTts();
+      try {
+        final bytes = await native.synthesize(
+          text: text,
+          voiceShortName: voiceShortName,
+          rate: rate,
+          pitch: pitch,
+          volume: volume,
+          debugCallback: debugCallback,
+        );
+        return bytes;
+      } finally {
+        await native.stop();
+      }
+    }
+
+    // iOS/macOS/Linux: use Dart WebSocket
+    debugCallback?.call('🍎 嘗試直接 Edge TTS...');
     try {
       final result = await _synthesizeViaWebSocket(text, voiceShortName, rate, pitch, debugCallback);
       if (result != null) return result;
