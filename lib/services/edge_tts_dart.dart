@@ -5,12 +5,14 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 import '../models/voice_option.dart';
 
-/// Direct Edge TTS via WebSocket — no proxy needed.
-/// Works on iOS and Android without any server.
-/// Based on edge-tts Python library v7.2.8 protocol.
+/// Edge TTS service with dual backends:
+/// - Direct WebSocket (iOS/macOS/Linux)
+/// - HTTP proxy fallback (Android — dart:io WebSocket has URL parsing bug)
 class EdgeTtsDart {
   // ═══════════════════════════════════════════════
   // EDGE TTS CONSTANTS
@@ -22,49 +24,42 @@ class EdgeTtsDart {
       'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       '?TrustedClientToken=$_trustedClientToken';
 
-  // Chromium version from edge-tts v7.2.8
   static const String _chromeVersion = '143.0.3650.75';
   static const String _chromeMajor = '143';
+
+  // HTTP proxy URL — Mac Python FastAPI proxy (fallback for Android)
+  // TODO: Auto-discover or configure this address
+  static const String _proxyUrl = 'http://192.168.31.124:8888';
 
   // ═══════════════════════════════════════════════
   // DRM HELPERS (from edge-tts drm.py)
   // ═══════════════════════════════════════════════
 
-  // Windows FILETIME epoch: 1601-01-01 00:00:00 UTC in Unix ms
   static const int _winEpochOffset = 11644473600000;
 
-  /// Generate Sec-MS-GEC token (same logic as Python edge-tts)
   String _generateSecMsGec() {
-    // Unix timestamp in milliseconds
     final unixMs = DateTime.now().toUtc().millisecondsSinceEpoch;
-    // Convert to Windows FILETIME (ticks = (unix_ms + win_epoch_offset) * 10000)
     final winTicks = (unixMs + _winEpochOffset) * 10000;
-    // Round down to nearest 5 minutes (300000ms * 10000 = 3000000000 ticks)
     final roundedTicks = (winTicks ~/ 3000000000) * 3000000000;
-    // Hash: SHA256(ticks_str + token), upper-case hex
     final toHash = '$roundedTicks$_trustedClientToken';
     final bytes = sha256.convert(utf8.encode(toHash)).bytes;
     return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
   }
 
-  /// Generate a random MUID for Cookie header
   String _generateMuid() {
     final rnd = Random.secure();
     final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
-    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join();
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
   }
 
-  /// Generate a UUID for ConnectionId
   String _generateConnectionId() {
     final rnd = Random.secure();
     final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
-    // Format as standard UUID
     final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     return '${hex.substring(0,8)}-${hex.substring(8,12)}-${hex.substring(12,16)}'
            '-${hex.substring(16,20)}-${hex.substring(20,32)}';
   }
 
-  /// Build full WSS URL with ConnectionId and Sec-MS-GEC params
   String _buildWsUrl() {
     final connId = _generateConnectionId();
     final secGec = _generateSecMsGec();
@@ -75,7 +70,6 @@ class EdgeTtsDart {
            '&Sec-MS-GEC-Version=$version';
   }
 
-  /// Build WSS headers (matches edge-tts constants.py WSS_HEADERS + Cookie)
   Map<String, String> _buildWsHeaders() {
     return {
       'Pragma': 'no-cache',
@@ -194,7 +188,7 @@ class EdgeTtsDart {
   // TTS SYNTHESIS
   // ═══════════════════════════════════════════════
 
-  /// Synthesize speech to MP3 bytes via direct Edge TTS WebSocket.
+  /// Main synthesize method — tries WebSocket first, falls back to HTTP proxy on Android.
   Future<Uint8List?> synthesize({
     required String text,
     required String voiceShortName,
@@ -203,13 +197,40 @@ class EdgeTtsDart {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
-    // 1. 強制清洗 URL，避免末尾出現 # 或空格
+    // Try WebSocket first (works on iOS/macOS/Linux)
+    debugCallback?.call('🔌 嘗試直接 Edge TTS...');
+    try {
+      final result = await _synthesizeViaWebSocket(text, voiceShortName, rate, pitch, debugCallback);
+      if (result != null) return result;
+    } catch (e) {
+      debugCallback?.call('⚠️ WebSocket 失敗: $e');
+    }
+
+    // Fallback: HTTP proxy on Mac (for Android with dart:io WebSocket bug)
+    debugCallback?.call('🔄 切換到 HTTP 代理...');
+    try {
+      final result = await _synthesizeViaHttpProxy(text, voiceShortName, rate, pitch, volume, debugCallback);
+      if (result != null) return result;
+    } catch (e) {
+      debugCallback?.call('❌ HTTP 代理也失敗: $e');
+    }
+
+    return null;
+  }
+
+  /// Direct WebSocket synthesis (iOS/macOS/Linux)
+  Future<Uint8List?> _synthesizeViaWebSocket(
+    String text,
+    String voiceShortName,
+    double rate,
+    double pitch,
+    void Function(String)? debugCallback,
+  ) async {
     final wsUrl = _buildWsUrl();
     debugCallback?.call('🔌 連接 Edge TTS...');
 
     WebSocket? ws;
     try {
-      // 2. 建立連接：動態 URL（包含 ConnectionId + Sec-MS-GEC）+ 完整 headers
       ws = await WebSocket.connect(
         wsUrl,
         headers: _buildWsHeaders(),
@@ -217,50 +238,86 @@ class EdgeTtsDart {
 
       debugCallback?.call('✅ 已連接');
 
-      // 3. 發送配置與 SSML
       ws.add(_buildSpeechConfig());
       await Future.delayed(const Duration(milliseconds: 50));
       ws.add(_buildSsml(text, voiceShortName, rate, pitch));
 
       final audioChunks = <int>[];
-
-      // 4. 解析二進制流
       await for (final msg in ws) {
         if (msg is List<int>) {
           final data = Uint8List.fromList(msg);
           if (data.length >= 2) {
-            // 解析 Header 長度 (Big-endian)
             final headerLen = (data[0] << 8) | data[1];
             final audioStart = 2 + headerLen;
-
-            // 確保只提取音頻數據部分
             if (audioStart < data.length) {
-              final audioPart = data.sublist(audioStart);
-              audioChunks.addAll(audioPart);
-              // debugCallback?.call('🔊 接收音頻幀: ${audioPart.length} bytes');
+              audioChunks.addAll(data.sublist(audioStart));
             }
           }
         } else if (msg is String) {
-          if (msg.contains('turn.end')) {
-            debugCallback?.call('🏁 收到結束信號 (turn.end)');
-            break;
-          }
+          if (msg.contains('turn.end')) break;
         }
       }
 
-      if (audioChunks.isEmpty) {
-        debugCallback?.call('❌ 錯誤：未收到任何音頻數據');
-        return null;
-      }
-
-      debugCallback?.call('🎉 合成完成，總計 ${audioChunks.length} bytes');
+      if (audioChunks.isEmpty) return null;
+      debugCallback?.call('🎉 直接 WebSocket 成功: ${audioChunks.length} bytes');
       return Uint8List.fromList(audioChunks);
 
     } catch (e) {
-      debugCallback?.call('❌ 異常: $e');
+      debugCallback?.call('❌ WebSocket 異常: $e');
       return null;
     } finally {
-      await ws?.close();
+      ws?.close();
+    }
+  }
+
+  /// HTTP proxy synthesis (Android fallback via Mac Python proxy)
+  Future<Uint8List?> _synthesizeViaHttpProxy(
+    String text,
+    String voiceShortName,
+    double rate,
+    double pitch,
+    double volume,
+    void Function(String)? debugCallback,
+  ) async {
+    debugCallback?.call("🌐 連接 Mac HTTP 代理 $_proxyUrl...");
+
+    final rateStr = rate >= 1.0
+        ? '+${((rate - 1.0) * 100).round()}%'
+        : '${((rate - 1.0) * 100).round()}%';
+    final pitchStr = pitch >= 1.0
+        ? '+${((pitch - 1.0) * 50).round()}Hz'
+        : '${((pitch - 1.0) * 50).round()}Hz';
+    final volStr = volume >= 1.0
+        ? '+${((volume - 1.0) * 100).round()}%'
+        : '${((volume - 1.0) * 100).round()}%';
+
+    final body = jsonEncode({
+      'text': text,
+      'voice': voiceShortName,
+      'rate': rateStr,
+      'pitch': pitchStr,
+      'volume': volStr,
+    });
+
+    try {
+      final response = await http.post(
+        Uri.parse('$_proxyUrl/tts'),
+        headers: {'Content-Type': 'application/json'},
+        body: body,
+      ).timeout(const Duration(seconds: 30));
+
+      debugCallback?.call("📥 HTTP 代理響應: ${response.statusCode}");
+
+      if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+        debugCallback?.call('🎉 HTTP 代理成功: ${response.bodyBytes.length} bytes');
+        return Uint8List.fromList(response.bodyBytes);
+      } else {
+        debugCallback?.call('❌ HTTP 代理失敗: ${response.statusCode}');
+        return null;
+      }
+    } catch (e) {
+      debugCallback?.call('❌ HTTP 代理異常: $e');
+      return null;
     }
   }
 
