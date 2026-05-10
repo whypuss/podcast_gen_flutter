@@ -1,21 +1,94 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/voice_option.dart';
 
 /// Direct Edge TTS via WebSocket — no proxy needed.
 /// Works on iOS and Android without any server.
-/// Based on the edge-tts Python library protocol.
+/// Based on edge-tts Python library v7.2.8 protocol.
 class EdgeTtsDart {
   // ═══════════════════════════════════════════════
   // EDGE TTS CONSTANTS
   // ═══════════════════════════════════════════════
 
-  static const String _wsUrl =
+  static const String _trustedClientToken =
+      '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+  static const String _baseWsUrl =
       'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
-      '?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+      '?TrustedClientToken=$_trustedClientToken';
+
+  // Chromium version from edge-tts v7.2.8
+  static const String _chromeVersion = '143.0.3650.75';
+  static const String _chromeMajor = '143';
+
+  // ═══════════════════════════════════════════════
+  // DRM HELPERS (from edge-tts drm.py)
+  // ═══════════════════════════════════════════════
+
+  // Windows FILETIME epoch: 1601-01-01 00:00:00 UTC in Unix ms
+  static const int _winEpochOffset = 11644473600000;
+
+  /// Generate Sec-MS-GEC token (same logic as Python edge-tts)
+  String _generateSecMsGec() {
+    // Unix timestamp in milliseconds
+    final unixMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    // Convert to Windows FILETIME (ticks = (unix_ms + win_epoch_offset) * 10000)
+    final winTicks = (unixMs + _winEpochOffset) * 10000;
+    // Round down to nearest 5 minutes (300000ms * 10000 = 3000000000 ticks)
+    final roundedTicks = (winTicks ~/ 3000000000) * 3000000000;
+    // Hash: SHA256(ticks_str + token), upper-case hex
+    final toHash = '$roundedTicks$_trustedClientToken';
+    final bytes = sha256.convert(utf8.encode(toHash)).bytes;
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
+  }
+
+  /// Generate a random MUID for Cookie header
+  String _generateMuid() {
+    final rnd = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join();
+  }
+
+  /// Generate a UUID for ConnectionId
+  String _generateConnectionId() {
+    final rnd = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+    // Format as standard UUID
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0,8)}-${hex.substring(8,12)}-${hex.substring(12,16)}'
+           '-${hex.substring(16,20)}-${hex.substring(20,32)}';
+  }
+
+  /// Build full WSS URL with ConnectionId and Sec-MS-GEC params
+  String _buildWsUrl() {
+    final connId = _generateConnectionId();
+    final secGec = _generateSecMsGec();
+    final version = '1-$_chromeVersion';
+    return '$_baseWsUrl'
+           '&ConnectionId=$connId'
+           '&Sec-MS-GEC=$secGec'
+           '&Sec-MS-GEC-Version=$version';
+  }
+
+  /// Build WSS headers (matches edge-tts constants.py WSS_HEADERS + Cookie)
+  Map<String, String> _buildWsHeaders() {
+    return {
+      'Pragma': 'no-cache',
+      'Cache-Control': 'no-cache',
+      'Accept-Encoding': 'gzip, deflate, br, zstd',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/$_chromeMajor.0.0.0 Safari/537.36 Edg/$_chromeMajor.0.0.0',
+      'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+      'Sec-WebSocket-Version': '13',
+      'Cookie': 'muid=${_generateMuid()};',
+    };
+  }
 
   // Edge TTS sends audio in chunks, we accumulate them here
   Uint8List? _audioBuffer;
@@ -58,12 +131,18 @@ class EdgeTtsDart {
   // WEBSOCKET MESSAGE BUILDERS
   // ═══════════════════════════════════════════════
 
+  /// JavaScript-style date string (matching edge-tts Python library exactly)
   String _buildTimestamp() {
     final now = DateTime.now().toUtc();
+    final weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    final months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final wd = weekdays[now.weekday - 1];
+    final mon = months[now.month - 1];
     final pad = (int v) => v.toString().padLeft(2, '0');
-    return '${now.year}-${pad(now.month)}-${pad(now.day)}-'
-        '${pad(now.hour)}:${pad(now.minute)}:${pad(now.second)}.'
-        '${(now.millisecond).toString().padLeft(3, '0')}Z';
+    return '$wd $mon ${now.day} ${now.year} '
+        '${pad(now.hour)}:${pad(now.minute)}:${pad(now.second)} '
+        'GMT+0000 (Coordinated Universal Time)';
   }
 
   String _buildSpeechConfig() {
@@ -79,22 +158,21 @@ class EdgeTtsDart {
 
   String _buildSsml(String text, String voiceShortName, double rate, double pitch) {
     final ts = _buildTimestamp();
-    // Edge TTS rate/pitch: 1.0 = normal. Convert from speed multiplier.
-    // speed: 1.0=normal, >1=faster, <1=slower
-    // pitch: 1.0=normal
-    final ratePercent = ((rate - 1.0) * 100).round();
-    final pitchHz = ((pitch - 1.0) * 50).round(); // ±50Hz
-    final ssmlPitch = pitch != 1.0 ? ' msst Pitch="${pitchHz}Hz"' : '';
+    // Edge TTS rate/pitch format: +N% / -N% for rate, +/-NHz for pitch/volume
+    final ratePct = ((rate - 1.0) * 100).round();
+    final pitchHz = ((pitch - 1.0) * 50).round();
+    final rateStr = ratePct >= 0 ? '+$ratePct%' : '$ratePct%';
+    final pitchStr = pitchHz >= 0 ? '+${pitchHz}Hz' : '${pitchHz}Hz';
 
     return 'X-RequestId:${_genReqId()}\r\n'
         'Content-Type:application/ssml+xml\r\n'
         'X-Timestamp:$ts\r\n'
         'Path:ssml\r\n\r\n'
-        '<speak version='"'"'1.0'"'"' '
-        'xmlns='"'"'http://www.w3.org/2001/10/synthesis'"'"' '
-        'xml:lang='"'"'${_voiceLocale(voiceShortName)}'"'"'>'
-        '<voice name='"'"'$voiceShortName'"'"'$ssmlPitch>'
-        '<prosody rate='"'"'$ratePercent%'"'"' pitch="${pitchHz}Hz">'
+        "<speak version='1.0' "
+        "xmlns='http://www.w3.org/2001/10/synthesis' "
+        "xml:lang='${_voiceLocale(voiceShortName)}'>"
+        "<voice name='$voiceShortName'>"
+        "<prosody pitch='$pitchStr' rate='$rateStr' volume='+0%'>"
         '$text'
         '</prosody></voice></speak>';
   }
@@ -126,21 +204,15 @@ class EdgeTtsDart {
     void Function(String)? debugCallback,
   }) async {
     // 1. 強制清洗 URL，避免末尾出現 # 或空格
-    final cleanUrl = _wsUrl.trim().split('#')[0];
-    debugCallback?.call('🔌 連接 Edge TTS (Android Fix Applied)...');
+    final wsUrl = _buildWsUrl();
+    debugCallback?.call('🔌 連接 Edge TTS...');
 
     WebSocket? ws;
     try {
-      // 2. 建立連接：移除 protocols，更新 UA 和 Origin
+      // 2. 建立連接：動態 URL（包含 ConnectionId + Sec-MS-GEC）+ 完整 headers
       ws = await WebSocket.connect(
-        cleanUrl,
-        headers: {
-          'Pragma': 'no-cache',
-          'Cache-Control': 'no-cache',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
-          'Origin': 'chrome-extension://jdiccldjedidmcnnefciiohendbhjhj',
-        },
+        wsUrl,
+        headers: _buildWsHeaders(),
       ).timeout(const Duration(seconds: 10));
 
       debugCallback?.call('✅ 已連接');
