@@ -1,14 +1,13 @@
-import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
-import '../models/voice_option.dart';
 
-/// Native Edge TTS via Android Ktor WebSocket — bypasses dart:io WebSocket URL parsing bug.
+/// Edge TTS using native Android OkHttp WebSocket — no proxy, no Dart WebSocket.
+/// Works completely standalone on Android via Method Channel.
 class NativeEdgeTts {
   static const _channel = MethodChannel('com.podcastgen.podcast_gen/edgetts');
 
-  /// Synthesize speech using native Android Ktor WebSocket engine.
+  /// Synthesize speech using native OkHttp Edge TTS WebSocket.
+  /// Returns audio bytes (Uint8List) on success, null on failure.
   Future<Uint8List?> synthesize({
     required String text,
     required String voiceShortName,
@@ -17,7 +16,7 @@ class NativeEdgeTts {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
-    debugCallback?.call('🔌 使用原生 Ktor 引擎...');
+    debugCallback?.call('🔌 使用原生 OkHttp Edge TTS 引擎...');
 
     try {
       // Convert rate/pitch/volume to edge-tts string format
@@ -31,7 +30,8 @@ class NativeEdgeTts {
           ? '+${((volume - 1.0) * 100).round()}%'
           : '${((volume - 1.0) * 100).round()}%';
 
-      final result = await _channel.invokeMethod<String>('synthesize', {
+      // Call native OkHttp WebSocket engine
+      final result = await _channel.invokeMethod<Uint8List>('synthesize', {
         'text': text,
         'voice': voiceShortName,
         'rate': rateStr,
@@ -40,21 +40,16 @@ class NativeEdgeTts {
         'outputFormat': 'audio-24khz-48kbitrate-mono-mp3',
       });
 
-      if (result != null) {
-        final file = File(result);
-        if (await file.exists()) {
-          final bytes = await file.readAsBytes();
-          await file.delete();
-          debugCallback?.call('🎉 原生合成成功: ${bytes.length} bytes');
-          return bytes;
-        }
+      if (result != null && result.isNotEmpty) {
+        debugCallback?.call('🎉 合成成功: ${result.length} bytes');
+        return result;
       }
 
-      debugCallback?.call('❌ 原生合成返回空');
+      debugCallback?.call('❌ 合成返回空');
       return null;
 
     } on PlatformException catch (e) {
-      debugCallback?.call('❌ 原生異常: ${e.message}');
+      debugCallback?.call('❌ PlatformException: ${e.message}');
       return null;
     } catch (e) {
       debugCallback?.call('❌ 錯誤: $e');

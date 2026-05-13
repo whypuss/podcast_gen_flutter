@@ -14,7 +14,7 @@ class MainActivity : FlutterActivity() {
     private val TTS_CHANNEL = "com.podcastgen.podcast_gen/edgetts"
     private var mediaPlayer: MediaPlayer? = null
     private var isPrepared = false
-    private var ttsEngine: EdgeTtsEngine? = null
+    private var ttsEngine: OkHttpEdgeTts? = null
     private val ttsScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -93,21 +93,22 @@ class MainActivity : FlutterActivity() {
                     val volume = call.argument<String>("volume") ?: "+0%"
                     val outputFormat = call.argument<String>("outputFormat") ?: "audio-24khz-48kbitrate-mono-mp3"
 
-                    ttsScope.launch {
-                        val engine = EdgeTtsEngine()
+                    ttsScope.launch(Dispatchers.IO) {
+                        val engine = OkHttpEdgeTts(this@MainActivity)
                         ttsEngine = engine
+                        // synthesize() returns ByteArray on success
                         val audioBytes = engine.synthesize(text, voice, rate, pitch, volume, outputFormat)
                         engine.close()
                         ttsEngine = null
 
-                        if (audioBytes != null && audioBytes.isNotEmpty()) {
-                            // Save to temp file and return path
-                            val cacheDir = cacheDir
-                            val outputFile = File(cacheDir, "edge_tts_output_${System.currentTimeMillis()}.mp3")
-                            FileOutputStream(outputFile).use { it.write(audioBytes) }
-                            result.success(outputFile.absolutePath)
-                        } else {
-                            result.error("TTS_ERROR", "No audio generated", null)
+                        withContext(Dispatchers.Main) {
+                            if (audioBytes != null && audioBytes.isNotEmpty()) {
+                                println("MainActivity: result.success returning ${audioBytes.size} bytes")
+                                result.success(audioBytes)
+                            } else {
+                                println("MainActivity: result.error TTS_ERROR No audio generated")
+                                result.error("TTS_ERROR", "No audio generated", null)
+                            }
                         }
                     }
                 }

@@ -1,239 +1,255 @@
 package com.podcastgen.podcast_gen
 
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
-import io.ktor.client.plugins.websocket.WebSockets
-import io.ktor.client.plugins.websocket.webSocketSession
-import io.ktor.client.request.header
-import io.ktor.client.request.url
-import io.ktor.websocket.Frame
-import io.ktor.websocket.close
-import io.ktor.websocket.readBytes
-import io.ktor.websocket.readReason
-import io.ktor.websocket.readText
-import io.ktor.websocket.send
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
-import java.math.BigInteger
-import java.security.MessageDigest
-import java.util.UUID
+import java.util.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Native Edge TTS engine using Ktor — bypasses dart:io WebSocket URL parsing bug on Android.
- * Uses test_ws4.py's EXACT parameters (verified working on Mac aiohttp).
+ * Native Android TTS engine using built-in TextToSpeech API.
+ * Works completely offline — no proxy, no network, no Ktor needed.
+ *
+ * Uses UtteranceProgressListener to reliably detect synthesis completion
+ * (no more Thread.sleep hacks).
  */
-class EdgeTtsEngine {
-    private var client: HttpClient? = null
-    private var session: DefaultClientWebSocketSession? = null
-    private val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO + SupervisorJob())
+class EdgeTtsEngine(private val context: Context) {
+    @Volatile private var tts: TextToSpeech? = null
+    @Volatile private var isTtsReady = false
+    private val ttsInitLock = CountDownLatch(1)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         private const val TAG = "EdgeTtsEngine"
-        private const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-        private const val WS_URL = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-        private const val CHROME_MAJOR = "143"
-        private const val CHROME_FULL = "143.0.3650.75"
-        private const val WIN_EPOCH_OFFSET = 11644473600000L  // ms
-        private const val CONNECT_TIMEOUT_MS = 15000L
-        private const val SYNTHESIS_TIMEOUT_MS = 30000L
-
-        // test_ws4.py's EXACT formula (verified working)
-        fun genSecMsGec(): String {
-            val unixMs = System.currentTimeMillis()
-            val winTicks = (unixMs + WIN_EPOCH_OFFSET) * 10000
-            val rounded = (winTicks / 3000000000) * 3000000000
-            val s = "$rounded$TRUSTED_CLIENT_TOKEN"
-            val digest = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
-            return digest.joinToString("") { "%02X".format(it) }
-        }
-
-        fun newUUID(): String = UUID.randomUUID().toString().replace("-", "")
-
-        private fun datetime2String(): String {
-            val now = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC)
-            val formatter = java.time.format.DateTimeFormatter.ofPattern(
-                "EEE MMM dd yyyy HH:mm:ss 'GMT+0000' '(Coordinated Universal Time)'",
-                java.util.Locale.ENGLISH
-            )
-            return now.format(formatter)
-        }
-
-        private fun log(msg: String) {
-            android.util.Log.d(TAG, msg)
-            try {
-                val f = File("/data/data/com.podcastgen.podcast_gen/cache/edge_tts_log.txt")
-                FileOutputStream(f, true).use {
-                    it.write(("[$TAG] ${java.text.SimpleDateFormat("HH:mm:ss.SSS").format(java.util.Date())} $msg\n").toByteArray())
-                }
-            } catch (_: Exception) {}
-        }
+        private const val INIT_TIMEOUT_MS = 10000L
+        private const val SYNTH_TIMEOUT_MS = 30000L
     }
 
-    private fun voiceLocale(voiceShortName: String): String {
-        // Extract locale from voice shortName like "zh-CN-XiaoxiaoNeural" → "zh-CN"
-        val parts = voiceShortName.split("-")
-        return if (parts.size >= 2) "${parts[0]}-${parts[1]}" else "en-US"
+    init {
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                isTtsReady = true
+                log("TTS init SUCCESS")
+            } else {
+                log("!!! TTS init FAILED status=$status")
+                isTtsReady = false
+            }
+            ttsInitLock.countDown()
+        }
+
+        Thread {
+            val awaitSuccess = ttsInitLock.await(INIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!awaitSuccess) {
+                log("!!! init latch TIMEOUT after ${INIT_TIMEOUT_MS}ms")
+            } else {
+                log("init latch released, isTtsReady=$isTtsReady")
+            }
+        }.start()
     }
 
-    suspend fun synthesize(
+    /**
+     * Synthesize speech using Android native TTS.
+     * Returns absolute file path on success, null on failure.
+     */
+    fun synthesize(
         text: String,
         voice: String,
         rate: String,
         pitch: String,
         volume: String,
         outputFormat: String
-    ): ByteArray? = withContext(Dispatchers.IO) {
-        log("=== synthesize START ===")
-        log("text=$text")
-        log("voice=$voice rate=$rate pitch=$pitch vol=$volume")
-
+    ): String? {
+        // Wait for TTS init to complete on IO thread (no-op if already done)
         try {
-            client = HttpClient(CIO) {
-                install(WebSockets) {
-                    pingIntervalMillis = 20_000L
+            val awaitSuccess = ttsInitLock.await(INIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!awaitSuccess) {
+                log("!!! synthesize: init latch TIMEOUT")
+                return null
+            }
+        } catch (e: Exception) {
+            log("!!! synthesize: latch await exception: ${e.message}")
+            return null
+        }
+
+        if (!isTtsReady || tts == null) {
+            log("!!! synthesize: TTS not ready (isTtsReady=$isTtsReady tts=${tts==null})")
+            return null
+        }
+
+        log("synthesize START: text_len=${text.length} voice=$voice")
+
+        // Parse rate: "+0%" or "-10%" → Android TTS rate (0.25-4.0, 1.0=normal)
+        val rateFloat = try {
+            val rawRate = rate.trim().removeSuffix("%").toFloat()
+            val sign = if (rate.trim().startsWith("+")) +1f else if (rate.trim().startsWith("-")) -1f else 0f
+            val pct = kotlin.math.abs(rawRate)
+            (100f + sign * pct) / 100f
+        } catch (e: Exception) { 1.0f }.coerceIn(0.25f, 4.0f)
+
+        // Parse pitch: "+0Hz" or "-10Hz" → Android TTS pitch (0.5-2.0, 1.0=normal)
+        val pitchFloat = try {
+            val rawPitch = pitch.trim().removeSuffix("Hz").toFloat()
+            (1.0f + rawPitch / 50f).coerceIn(0.5f, 2.0f)
+        } catch (e: Exception) { 1.0f }
+
+        log("rate=$rateFloat pitch=$pitchFloat")
+
+        // Map voice shortName to TTS locale
+        val localeStr = voiceLocale(voice)
+        val ttsLocale = try {
+            Locale.forLanguageTag(localeStr)
+        } catch (e: Exception) { Locale.US }
+
+        // Synchronization for async callback
+        val synthDone = CountDownLatch(1)
+        val synthSuccess = AtomicBoolean(false)
+        var synthError: String? = null
+        var tempFile: File? = null  // defined at function scope, set inside post { }
+
+        // Set up utterance progress listener BEFORE synthesizing
+        // Must be set on main thread
+        mainHandler.post {
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(uttId: String?) {
+                    log("utterance START: $uttId")
                 }
-            }
 
-            val url = buildUrl()
-            log("URL=$url")
+                override fun onDone(uttId: String?) {
+                    log("utterance DONE: $uttId")
+                    synthSuccess.set(true)
+                    synthDone.countDown()
+                }
 
-            session = client!!.webSocketSession {
-                url(url)
-                header("Pragma", "no-cache")
-                header("Cache-Control", "no-cache")
-                header("Accept-Encoding", "gzip, deflate, br, zstd")
-                header("Accept-Language", "en-US,en;q=0.9")
-                header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$CHROME_MAJOR.0.0.0 Safari/537.36 Edg/$CHROME_MAJOR.0.0.0"
-                )
-                header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-                header("Sec-WebSocket-Version", "13")
-            }
+                @Deprecated("Deprecated in Java", ReplaceWith("onError(uttId, errorCode)"))
+                override fun onError(uttId: String?) {
+                    log("!!! utterance ERROR: $uttId")
+                    synthError = "error_utt_$uttId"
+                    synthDone.countDown()
+                }
 
-            log("WebSocket session opened")
+                override fun onError(uttId: String?, errorCode: Int) {
+                    log("!!! utterance ERROR[$errorCode]: $uttId")
+                    synthError = "error_code_$errorCode"
+                    synthDone.countDown()
+                }
+            })
 
-            val speechConfig = buildSpeechConfig(outputFormat)
-            val ssml = buildSSML(text, voice, rate, pitch, volume)
+            // Apply voice settings
+            tts?.setSpeechRate(rateFloat)
+            tts?.setPitch(pitchFloat)
 
-            log("Sending speech.config (${speechConfig.length} chars)")
-            session!!.send(Frame.Text(speechConfig))
-            delay(100)
+            val langResult = tts?.setLanguage(ttsLocale)
+            log("setLanguage($ttsLocale) = $langResult (available=${langResult == TextToSpeech.LANG_AVAILABLE})")
 
-            log("Sending SSML (${ssml.length} chars)")
-            session!!.send(Frame.Text(ssml))
-
-            val audioChunks = mutableListOf<Byte>()
-            var frameCount = 0
-
-            withTimeout(SYNTHESIS_TIMEOUT_MS) {
-                for (frame in session!!.incoming) {
-                    frameCount++
-                    when (frame) {
-                        is Frame.Text -> {
-                            val data = frame.readText()
-                            log("Frame[$frameCount] TEXT: ${data.take(80)}")
-                            if (data.contains("Path:turn.end")) {
-                                log("Got turn.end")
-                                break
-                            }
+            // Try to select Neural/Premium voice
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                try {
+                    val voices = tts?.voices
+                    if (!voices.isNullOrEmpty()) {
+                        val shortName = voiceShortName(voice)
+                        val matched = voices.firstOrNull { v ->
+                            v.locale == ttsLocale && (
+                                v.name.contains(shortName, ignoreCase = true) ||
+                                v.name.contains("Neural", ignoreCase = true) ||
+                                v.name.contains("Premium", ignoreCase = true)
+                            )
                         }
-                        is Frame.Binary -> {
-                            val data = frame.readBytes()
-                            log("Frame[$frameCount] BINARY: ${data.size} bytes")
-                            if (data.size > 2) {
-                                // test_ws4.py: header_len = struct.unpack(">H", data[:2])[0]
-                                val headerLen = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
-                                val audio = data.copyOfRange(2 + headerLen, data.size)
-                                audioChunks.addAll(audio.toList())
-                                log("  → headerLen=$headerLen audioLen=${audio.size} total=${audioChunks.size}")
-                            }
-                        }
-                        is Frame.Close -> {
-                            log("Frame[$frameCount] CLOSE: ${frame.readReason()?.message}")
-                            break
-                        }
-                        else -> {
-                            log("Frame[$frameCount] ${frame::class.simpleName}")
+                        if (matched != null) {
+                            tts?.voice = matched
+                            log("Voice set: ${matched.name}")
+                        } else {
+                            log("No Neural voice match for '$shortName', available: ${voices.take(3).map { it.name }}")
                         }
                     }
+                } catch (e: Exception) {
+                    log("Voice lookup failed: ${e.message}")
                 }
             }
 
-            log("Receive done. frames=$frameCount audioBytes=${audioChunks.size}")
-            session!!.close()
-            client!!.close()
+            // Build output file (accessible outside post block via tempFile var)
+            val cacheDir = context.cacheDir
+            tempFile = File(cacheDir, "tts_out_${System.currentTimeMillis()}.wav")
+            val utteranceId = "utt_${System.currentTimeMillis()}"
 
-            if (audioChunks.isEmpty()) {
-                log("!!! ERROR: No audio chunks")
-                null
-            } else {
-                audioChunks.toByteArray()
+            // synthesizeToFile — works on all Android versions including 13+
+            @Suppress("DEPRECATION")
+            val result = tts?.synthesizeToFile(text, null, tempFile, utteranceId)
+            log("synthesizeToFile result=$result file=${tempFile?.absolutePath}")
+
+            if (result != TextToSpeech.SUCCESS) {
+                synthError = "result_$result"
+                synthDone.countDown()
             }
+            // If SUCCESS, callback (onDone/onError) will countDown
+        }
 
-        } catch (e: TimeoutCancellationException) {
-            log("!!! TIMEOUT: ${e.message}")
-            try { session?.close(); client?.close() } catch (_: Exception) {}
+        // Wait for callback with timeout
+        val waited = synthDone.await(SYNTH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        if (!waited) {
+            log("!!! synthesize TIMEOUT after ${SYNTH_TIMEOUT_MS}ms")
+            return null
+        }
+        if (!synthSuccess.get()) {
+            log("!!! synthesize FAILED: $synthError")
+            return null
+        }
+
+        // Settle time for file system
+        Thread.sleep(150)
+
+        val f = tempFile
+        return if (f != null && f.exists() && f.length() > 100) {
+            val size = f.length()
+            log("Audio ready: ${size} bytes → ${f.absolutePath}")
+            // Copy to a permanent location before Flutter deletes the original
+            try {
+                val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS)
+                val permFile = File(downloadsDir, "PodcastGen_test_${System.currentTimeMillis()}.wav")
+                f.copyTo(permFile, overwrite = true)
+                log("Saved copy to: ${permFile.absolutePath}")
+            } catch (e: Exception) {
+                log("Copy to Downloads failed: ${e.message}")
+            }
+            f.absolutePath
+        } else {
+            log("!!! File missing or too small: exists=${f?.exists()} size=${f?.length()}")
             null
-        } catch (e: Exception) {
-            log("!!! ERROR: ${e.message}")
-            e.printStackTrace()
-            try { session?.close(); client?.close() } catch (_: Exception) {}
-            null
-        } finally {
-            log("=== synthesize END ===")
         }
     }
 
-    private fun buildUrl(): String {
-        val connId = newUUID()
-        val secGec = genSecMsGec()
-        val version = "1-$CHROME_FULL"
-        return "$WS_URL&ConnectionId=$connId&Sec-MS-GEC=$secGec&Sec-MS-GEC-Version=$version"
+    private fun voiceShortName(voice: String): String {
+        val parts = voice.split("-")
+        return if (parts.size >= 3) parts[parts.size - 1].removeSuffix("Neural") else voice
     }
 
-    // FIXED: no leading newline (was trimIndent which kept the leading \n from indentation)
-    private fun buildSpeechConfig(outputFormat: String): String {
-        val timestamp = datetime2String()
-        val reqId = newUUID()
-        return "${reqId}\r\n" +
-            "Content-Type:application/json; charset=utf-8\r\n" +
-            "X-Timestamp:$timestamp\r\n" +
-            "Path:speech.config\r\n\r\n" +
-            "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"$outputFormat\"}}}}"
-    }
-
-    private fun buildSSML(text: String, voice: String, rate: String, pitch: String, volume: String): String {
-        val timestamp = datetime2String()
-        val reqId = newUUID()
-        val locale = voiceLocale(voice)
-        val escaped = text
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-            .replace("'", "&apos;")
-        return "$reqId\r\n" +
-            "Content-Type:application/ssml+xml\r\n" +
-            "X-Timestamp:$timestamp\r\n" +
-            "Path:ssml\r\n\r\n" +
-            "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='$locale'><voice name='$voice'><prosody pitch='$pitch' rate='$rate' volume='$volume'>$escaped</prosody></voice></speak>"
+    private fun voiceLocale(voice: String): String {
+        val parts = voice.split("-")
+        return if (parts.size >= 2) "${parts[0]}-${parts[1]}" else "en-US"
     }
 
     fun close() {
         try {
-            scope.launch { session?.close() }
-            client?.close()
+            tts?.stop()
+            tts?.shutdown()
         } catch (_: Exception) {}
-        scope.cancel()
+    }
+
+    private fun log(msg: String) {
+        android.util.Log.d(TAG, msg)
+        try {
+            val f = File("/data/data/com.podcastgen.podcast_gen/cache/edge_tts_log.txt")
+            FileOutputStream(f, true).use {
+                it.write(("[${java.text.SimpleDateFormat("HH:mm:ss.SSS").format(java.util.Date())}] $msg\n").toByteArray())
+            }
+        } catch (_: Exception) {}
     }
 }

@@ -6,10 +6,7 @@ plugins {
 }
 
 dependencies {
-    // Ktor for WebSocket — bypasses dart:io WebSocket URL parsing bug on Android
-    implementation("io.ktor:ktor-client-core:3.0.3")
-    implementation("io.ktor:ktor-client-cio:3.0.3")
-    implementation("io.ktor:ktor-client-websockets:3.0.3")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 
 android {

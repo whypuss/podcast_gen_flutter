@@ -10,9 +10,23 @@ import '../widgets/text_area.dart';
 
 const kDemoScript = '''[1] 大家好，歡迎來到 Podcast Gen！我是今天的主持人。
 [2] 我是你的搭檔，今天我們來介紹這個強大的語音合成工具。
-[1] 支援多種語言音色，音色自然流暒。
-[2] 而且完全免費使用，適合做內容創作。
-[3] 即刻開始，輸入你的腳本，點擊生成按鈕，即可獲得專業 Podcast。''';
+[1] 首先，什麼是 Podcast Gen 呢？
+[2] 簡單來說，它是一款結合了 Edge TTS 語音合成技術的 Podcast 自動生成工具。
+[1] 支援多種語言，包括中文、英語、日語、韓語等等。
+[2] 而且音色非常自然，完全免費使用，適合內容創作者。
+[1] 接下來，我們來看看如何使用這個工具。
+[2] 第一步，選擇你喜歡的音色，這裡有多種選項。
+[1] 第二步，輸入你的腳本內容，可以是任何主題的文章或文字。
+[2] 第三步，點擊生成按鈕，系統會自動將文字轉換為語音。
+[1] 生成的音頻可以即時播放，也可以下載保存。
+[2] 這個工具非常適合用來製作教育類內容。
+[1] 比如語言學習、知識科普、商業簡報等等。
+[2] 而且所有功能都是免費的，無需註冊登入。
+[1] 最後，讓我們來做一個簡單的總結。
+[2] Podcast Gen 是一款方便快捷的語音合成工具，值得一試。
+[1] 如果你有任何問題，歡迎在描述區留言。
+[2] 今天的節目就到這裡，感謝大家的聆聽！
+[1] 我是你的搭檔，下次見！''';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -28,9 +42,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _playbackTimer;
 
   // Voice selections (edge short names)
-  String _voice1 = 'zh-CN-XiaoxiaoNeural';
-  String _voice2 = 'zh-CN-YunxiNeural';
-  String _narrationVoice = 'zh-CN-YunyangNeural';
+  String _voice1 = 'zh-HK-HiuGaaiNeural';  // 粵語 (女)
+  String _voice2 = 'zh-HK-WanLungNeural';   // 粵語 (男)
+  String _narrationVoice = 'zh-HK-WanLungNeural'; // 粵語 (旁白)
   double _speed = 1.0;
   bool _mixed = true;
   int _activeTab = 0;
@@ -40,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Segment> _segments = [];
   List<ParsedLine> _preview = [];
   int? _playingIdx;
+  bool _isMergedPlaying = false;
   String? _mergedPath;
 
   // Cached voices
@@ -64,13 +79,29 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadVoices();
   }
 
+  void _writeDebug(String msg) {
+    final ts = DateTime.now().toString().substring(11, 23);
+    final line = "[$ts] $msg\n";
+    try {
+      File("/sdcard/app_debug.txt").writeAsStringSync(line, mode: FileMode.append);
+    } catch (_) {}
+    print("HERMES: $line");
+  }
+
   Future<void> _loadVoices() async {
-    final voices = await _tts.getVoices();
-    if (mounted) {
-      setState(() {
-        _allVoices = voices;
-        _voicesLoaded = true;
-      });
+    _addDebug("HERMES: _loadVoices START");
+    try {
+      final voices = await _tts.getVoices();
+      _addDebug("HERMES: _loadVoices got ${voices.length} voices");
+      if (mounted) {
+        setState(() {
+          _allVoices = voices;
+          _voicesLoaded = true;
+        });
+        _addDebug("HERMES: _loadVoices setState done, _voicesLoaded=true");
+      }
+    } catch (e, st) {
+      _addDebug("HERMES: _loadVoices EXCEPTION: $e $st");
     }
   }
 
@@ -90,49 +121,68 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _generate() async {
+    print("HERMES: _generate ENTRY");
     if (_loading) return;
+    print("HERMES: _generate past loading check");
     setState(() {
       _loading = true;
       _segments = [];
       _mergedPath = null;
       _progress = '';
-      _activeTab = 1;
     });
 
-    final segs = await _tts.generatePodcast(
-      script: _scriptCtrl.text,
-      voice1: _voice1,
-      voice2: _voice2,
-      narrationVoice: _narrationVoice,
-      speed: _speed,
-      onProgress: (p) {
-        _addDebug(p);
-        if (mounted) setState(() => _progress = p);
-      },
-      debugCallback: _addDebug,
-    );
+    print("HERMES: _generate setState done, about to call generatePodcast");
+    try {
+      print("HERMES: _generate calling tts.generatePodcast now...");
+      print("HERMES: _generate about to call tts.generatePodcast...");
+      final segs = await _tts.generatePodcast(
+        script: _scriptCtrl.text,
+        voice1: _voice1,
+        voice2: _voice2,
+        narrationVoice: _narrationVoice,
+        speed: _speed,
+        onProgress: (p) {
+          try {
+            _addDebug(p);
+          } catch (e) {
+            print("HERMES: onProgress _addDebug EXCEPTION: $e");
+          }
+        },
+        debugCallback: _addDebug,
+      );
 
-    // Merge if requested
-    String? merged;
-    if (_mixed && segs.isNotEmpty && segs.every((s) => s.audioPath != null)) {
-      final dir = await getTemporaryDirectory();
-      merged = '${dir.path}/podcast_${DateTime.now().millisecondsSinceEpoch}.mp3';
-      final paths = segs.where((s) => s.audioPath != null).map((s) => s.audioPath!).toList();
-      final result = await _tts.mergeMp3Files(paths, merged);
-      merged = result;
-    }
+      print("HERMES: _generate back from generatePodcast, segs.length=${segs.length}");
 
-    if (mounted) {
-      setState(() {
-        _segments = segs;
-        _mergedPath = merged;
-        _loading = false;
-        _progress = '';
-      });
+      // Merge if requested
+      String? merged;
+      if (_mixed && segs.isNotEmpty && segs.every((s) => s.audioPath != null)) {
+        final dir = await getTemporaryDirectory();
+        merged = '${dir.path}/podcast_${DateTime.now().millisecondsSinceEpoch}.mp3';
+        final paths = segs.where((s) => s.audioPath != null).map((s) => s.audioPath!).toList();
+        final result = await _tts.mergeMp3Files(paths, merged);
+        merged = result;
+      }
+
+      if (mounted) {
+        setState(() {
+          _segments = segs;
+          _mergedPath = merged;
+          if (segs.isNotEmpty) _activeTab = 1;
+        });
+      }
+    } catch (e) {
+      _addDebug('❌ 生成失敗: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _progress = '';
+        });
+      }
     }
   }
 
-  void _playSeg(int idx) async {
+  Future<void> _playSeg(int idx) async {
     final seg = _segments[idx];
     if (seg.audioPath == null) return;
 
@@ -150,10 +200,15 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  void _playMerged() async {
+  Future<void> _playMerged() async {
     if (_mergedPath == null) return;
-    await _player.stop();
-    await _player.play(_mergedPath!);
+    if (_isMergedPlaying) {
+      await _player.pause();
+      setState(() => _isMergedPlaying = false);
+    } else {
+      await _player.play(_mergedPath!);
+      setState(() => _isMergedPlaying = true);
+    }
   }
 
   Future<void> _shareAudio(String path) async {
@@ -177,7 +232,6 @@ class _HomeScreenState extends State<HomeScreen> {
     switch (locale) {
       case 'zh-CN': return '普通話';
       case 'zh-HK': return '粵語';
-      case 'zh-TW': return '台語';
       case 'en-US': return '英語';
       case 'ja-JP': return '日語';
       case 'ko-KR': return '韓語';
@@ -190,7 +244,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<String> get _localeTabs {
     final locales = _voicesByLocale.keys.toList();
     // Prioritize useful ones
-    final priority = ['zh-CN', 'zh-HK', 'zh-TW', 'en-US', 'ja-JP', 'ko-KR'];
+    final priority = ['zh-CN', 'zh-HK', 'en-US', 'ja-JP', 'ko-KR'];
     final sorted = <String>[];
     for (final l in priority) {
       if (locales.contains(l)) { sorted.add(l); locales.remove(l); }
@@ -208,7 +262,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _voiceLabel(String shortName) {
-    final voice = _allVoices.where((v) => v.shortName == shortName).firstOrNull;
+    // Chinese names for common voices
+    final cnNames = {
+      'zh-CN-XiaoxiaoNeural': '曉曉（女）',
+      'zh-CN-XiaoyiNeural': '曉逸（女）',
+      'zh-CN-YunjianNeural': '云劍（男）',
+      'zh-CN-YunxiNeural': '云溪（男）',
+      'zh-CN-YunxiaNeural': '云夏（男）',
+      'zh-CN-YunyangNeural': '云揚（男）',
+      'zh-HK-HiuGaaiNeural': '凱悅（女）',
+      'zh-HK-HiuMaanNeural': '曉敏（女）',
+      'zh-HK-WanLungNeural': '雲龍（男）',
+    };
+    if (cnNames.containsKey(shortName)) return cnNames[shortName]!;
+    final voice = _allVoices.cast<EdgeVoice?>().firstWhere((v) => v?.shortName == shortName, orElse: () => null);
     if (voice != null) return '${voice.friendlyName}（${_genderLabel(voice.gender)}）';
     return shortName;
   }
@@ -220,9 +287,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _speakerLabel(String s) {
-    return s == '1' ? '嘉賓1'
-        : s == '2' ? '嘉賓2'
-        : '旁白';
+    return s == '1' ? '角色1'
+        : s == '2' ? '角色2'
+        : '角色3';
   }
 
   @override
@@ -575,11 +642,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _voiceCard() {
     return _card([
       _cardLabel('音色設定', Icons.record_voice_over),
-      _voiceSelector('嘉賓1', _voice1, (v) => setState(() => _voice1 = v)),
+      _voiceSelector('角色1', _voice1, (v) => setState(() => _voice1 = v)),
       const Divider(height: 1),
-      _voiceSelector('嘉賓2', _voice2, (v) => setState(() => _voice2 = v)),
+      _voiceSelector('角色2', _voice2, (v) => setState(() => _voice2 = v)),
       const Divider(height: 1),
-      _voiceSelector('旁白', _narrationVoice, (v) => setState(() => _narrationVoice = v)),
+      _voiceSelector('角色3', _narrationVoice, (v) => setState(() => _narrationVoice = v)),
     ]);
   }
 
@@ -620,7 +687,10 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             const Text('選擇音色', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
-            Flexible(
+            ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(context).size.height * 0.5,
+              ),
               child: ListView(
                 shrinkWrap: true,
                 children: _currentLocaleVoices.map((v) {
@@ -628,11 +698,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   return ListTile(
                     leading: Icon(v.gender == 'Female' ? Icons.person : Icons.person_outline,
                         color: selected ? const Color(0xFF007AFF) : Colors.grey),
-                    title: Text(v.friendlyName, style: TextStyle(
+                    title: Text(_voiceLabel(v.shortName), style: TextStyle(
                       fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
                       color: selected ? const Color(0xFF007AFF) : Colors.black,
                     )),
-                    subtitle: Text(v.name, style: const TextStyle(fontSize: 11)),
+                    subtitle: Text(v.shortName, style: const TextStyle(fontSize: 11)),
                     trailing: selected ? const Icon(Icons.check, color: Color(0xFF007AFF)) : null,
                     onTap: () {
                       onChanged(v.shortName);
@@ -743,7 +813,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.play_circle_fill, color: Colors.white, size: 36),
+            icon: Icon(_isMergedPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled, color: Colors.white, size: 36),
             onPressed: _playMerged,
           ),
           IconButton(

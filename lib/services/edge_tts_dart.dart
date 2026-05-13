@@ -15,6 +15,16 @@ import 'native_edge_tts.dart';
 /// Edge TTS service with dual backends:
 /// - Direct WebSocket (iOS/macOS/Linux)
 /// - HTTP proxy fallback (Android — dart:io WebSocket has URL parsing bug)
+// Debug to /sdcard (accessible via adb pull)
+void _dbg(String msg) {
+  try {
+    File("/sdcard/edge_tts_debug.txt").writeAsStringSync(
+      "\${DateTime.now()} \$msg\n",
+      mode: FileMode.append,
+    );
+  } catch (_) {}
+}
+
 class EdgeTtsDart {
   // ═══════════════════════════════════════════════
   // EDGE TTS CONSTANTS
@@ -29,9 +39,8 @@ class EdgeTtsDart {
   static const String _chromeVersion = '143.0.3650.75';
   static const String _chromeMajor = '143';
 
-  // HTTP proxy URL — Mac Python FastAPI proxy (fallback for Android)
-  // TODO: Auto-discover or configure this address
-  static const String _proxyUrl = 'http://192.168.31.124:8888';
+  // HTTP proxy URL — Mac LAN IP (emulator on same 192.168.31.x network)
+  static const String _proxyUrl = 'http://192.168.31.124:8898';
 
   // ═══════════════════════════════════════════════
   // DRM HELPERS (from edge-tts drm.py)
@@ -101,8 +110,6 @@ class EdgeTtsDart {
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunxiNeural)', shortName: 'zh-CN-YunxiNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunxi'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunxiaNeural)', shortName: 'zh-CN-YunxiaNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunxia'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-CN, YunyangNeural)', shortName: 'zh-CN-YunyangNeural', gender: 'Male', locale: 'zh-CN', friendlyName: 'Yunyang'),
-    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-TW, HsiaoYuNeural)', shortName: 'zh-TW-HsiaoYuNeural', gender: 'Female', locale: 'zh-TW', friendlyName: 'HsiaoYu'),
-    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-TW, YunJheNeural)', shortName: 'zh-TW-YunJheNeural', gender: 'Male', locale: 'zh-TW', friendlyName: 'YunJhe'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, HiuGaaiNeural)', shortName: 'zh-HK-HiuGaaiNeural', gender: 'Female', locale: 'zh-HK', friendlyName: 'HiuGaai'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, HiuMaanNeural)', shortName: 'zh-HK-HiuMaanNeural', gender: 'Female', locale: 'zh-HK', friendlyName: 'HiuMaan'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (zh-HK, WanLungNeural)', shortName: 'zh-HK-WanLungNeural', gender: 'Male', locale: 'zh-HK', friendlyName: 'WanLung'),
@@ -113,6 +120,9 @@ class EdgeTtsDart {
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)', shortName: 'en-US-AriaNeural', gender: 'Female', locale: 'en-US', friendlyName: 'Aria'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, GuyNeural)', shortName: 'en-US-GuyNeural', gender: 'Male', locale: 'en-US', friendlyName: 'Guy'),
     EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (en-US, JennyNeural)', shortName: 'en-US-JennyNeural', gender: 'Female', locale: 'en-US', friendlyName: 'Jenny'),
+    // Korean
+    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (ko-KR, SunHiNeural)', shortName: 'ko-KR-SunHiNeural', gender: 'Female', locale: 'ko-KR', friendlyName: 'SunHi'),
+    EdgeVoice(name: 'Microsoft Server Speech Text to Speech Voice (ko-KR, InJoonNeural)', shortName: 'ko-KR-InJoonNeural', gender: 'Male', locale: 'ko-KR', friendlyName: 'InJoon'),
   ];
 
   // ═══════════════════════════════════════════════
@@ -199,12 +209,16 @@ class EdgeTtsDart {
     double volume = 1.0,
     void Function(String)? debugCallback,
   }) async {
+    _dbg("synthesize ENTRY text_len=\${text.length}");
+    Uint8List? androidResult;
+
     // Android: use native Ktor WebSocket engine
     if (Platform.isAndroid) {
       debugCallback?.call('🤖 Android: 使用原生 Ktor 引擎...');
       final native = NativeEdgeTts();
       try {
-        final bytes = await native.synthesize(
+        _dbg("Calling native.synthesize...");
+        androidResult = await native.synthesize(
           text: text,
           voiceShortName: voiceShortName,
           rate: rate,
@@ -212,10 +226,17 @@ class EdgeTtsDart {
           volume: volume,
           debugCallback: debugCallback,
         );
-        return bytes;
+        _dbg("native returned: \${androidResult?.length ?? 'NULL'}");
+        if (androidResult != null) return androidResult;
+      } catch (e, st) {
+        _dbg("native EXCEPTION: \$e\n\$st");
+        debugCallback?.call('❌ Ktor 異常: \$e');
       } finally {
+        _dbg("native.stop");
         await native.stop();
       }
+      _dbg("FALLING THROUGH to HTTP proxy");
+      debugCallback?.call('🤖 Ktor 返回空，嘗試 HTTP 代理...');
     }
 
     // iOS/macOS/Linux: use Dart WebSocket
@@ -377,13 +398,32 @@ class EdgeTtsDart {
     required Function(String) onProgress,
     void Function(String)? debugCallback,
   }) async {
-    final lines = parseScript(script);
+    try {
+      print("HERMES: generatePodcast START script_len=${script.length}");
+    } catch (e, st) {
+      print("HERMES: START try-catch FAIL: $e $st");
+    }
+    List<ParsedLine> lines;
+    try {
+      lines = parseScript(script);
+      print("HERMES: parseScript done, ${lines.length} lines");
+    } catch (e, st) {
+      print("HERMES: parseScript EXCEPTION: $e $st");
+      return [];
+    }
+    print("HERMES: about to create segments list");
     final segments = <Segment>[];
+    // Save to app-private temp directory (bypasses MediaProvider scoped storage)
     final dir = await getTemporaryDirectory();
+    print("HERMES: dir resolved: ${dir.path}");
+    print("HERMES: entering for loop, ${lines.length} lines");
 
     for (int i = 0; i < lines.length; i++) {
+      print("HERMES: for loop i=$i");
       final line = lines[i];
+      print("HERMES: got line $i: speaker=${line.speaker}");
       onProgress('生成 ${i + 1}/${lines.length}...');
+      print("HERMES: onProgress done");
 
       String voiceKey;
       if (line.speaker == '1') {
@@ -404,14 +444,39 @@ class EdgeTtsDart {
         shortName = found.shortName;
       }
 
-      final filePath = '${dir.path}/segment_${i}_${DateTime.now().millisecondsSinceEpoch}.mp3';
-      final result = await synthesizeToFile(
-        text: line.text,
-        voiceShortName: shortName,
-        outputPath: filePath,
-        rate: speed,
-        debugCallback: debugCallback,
-      );
+      // Use native Android Ktor or WebSocket — no proxy needed
+      String? result;
+      try {
+        debugCallback?.call('--- PARAGRAPH ${i+1}/${lines.length} START ---');
+        debugCallback?.call('PARA text=${line.text.substring(0, line.text.length > 20 ? 20 : line.text.length)}...');
+
+        // Use native Ktor on Android, WebSocket on other platforms
+        final audio = await synthesize(
+          text: line.text,
+          voiceShortName: shortName,
+          rate: speed,
+          pitch: 1.0,
+          volume: 1.0,
+          debugCallback: debugCallback,
+        );
+
+        if (audio != null && audio.isNotEmpty) {
+          final filename = 'p${i}_${DateTime.now().millisecondsSinceEpoch}.mp3';
+          final file = File('${dir.path}/$filename');
+          print("HERMES: PARA ${i+1} about to write ${audio.length} bytes to ${file.path}");
+          try {
+            await file.writeAsBytes(audio);
+            result = file.path;
+            print("HERMES: PARA ${i+1} SUCCESS: ${audio.length} bytes -> $result");
+          } catch (e, st) {
+            print("HERMES: PARA ${i+1} WRITE EXCEPTION: $e");
+          }
+        } else {
+          print("HERMES: PARA ${i+1} FAILED: synthesize returned null/empty");
+        }
+      } catch (e, st) {
+        debugCallback?.call('PARA ${i+1} EXCEPTION: $e\n$st');
+      }
 
       segments.add(Segment(
         index: i,
@@ -422,8 +487,13 @@ class EdgeTtsDart {
         error: result == null ? 'Failed to generate audio' : null,
         duration: (line.text.length / (speed * 5)).clamp(1.0, 30.0),
       ));
+
+      // Give Flutter a chance to process events between paragraphs
+      await Future.delayed(const Duration(milliseconds: 50));
+      print("HERMES: for loop iteration $i done, segments=${segments.length}");
     }
 
+    print("HERMES: generatePodcast END, total segments=${segments.length}");
     return segments;
   }
 
